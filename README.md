@@ -2,7 +2,7 @@
 
 This project employs xgboost to predict death risk using the California Teachers Study(CTS) data,  together with OSHPD hospitalization records.  The main objective of this project is to predict the short-term risk of death based on prior in-patient hospitalization, counting for subject-specific factors such as baseline characteristics from the CTS questionnaires 1-3(e.g. race, ethnicity,height, co-morbidties). We will develop the best fitting model through machine learning xgboost method to predict the probability of death within 60 days.
 
-[see the full report here](https://raw.githack.com/yungson/CTS-death-prediction/main/cts-death-prediction.html)
+[see the full report here](https://yungson.github.io/CTS-death-prediction/cts-death-prediction.html)
 
 ## Results
 
