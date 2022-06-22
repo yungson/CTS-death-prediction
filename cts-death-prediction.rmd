@@ -1,0 +1,707 @@
+---
+title: "report"
+author: "Yongsheng Li"
+output: 
+  html_notebook:
+    code_folding: hide          
+---
+
+
+
+## Introduction
+
+
+This project employs data science methods to analyze a health-related data set. The California Teachers Study(CTS), together with OSHPD hospitalization records provide the information of California teachers about their health and lives. Hospitalizations of CTS participants from 2000 through 2015 will be used. The main objective of this project is to predict the short-term risk of  death based on prior in-patient hospitalization, counting for  subject-specific factors such as baseline characteristics from the CTS questionnaires 1-3(e.g. race, ethnicity,height, co-morbidties). We will develop the best fitting model through machine learning xgboost method to predict the probability of death within 60 days.
+
+
+```{r, warning=FALSE,message=FALSE}
+
+params <- c("S:/Researcher Projects/Self Service Analysis Projects/10017_USCDAT/Yongsheng Li/",
+            "O:/Datasets/10017_USCDAT/v01/10017_USCDAT_v01_20210609_2220_formats.csv",
+            "O:/Datasets/10017_USCDAT/v01/10017_USCDAT_v01_20210609_2220_analytic_data.csv",
+            "O:/Datasets/10017_USCDAT/uscdat_oshpd_formats.csv",
+            "O:/Datasets/10017_USCDAT/uscdat_oshpd.csv")
+setwd(params[1])
+
+library(dplyr)
+library(data.table)
+library(ggplot2)
+library(mlr3)
+library(xgboost)
+library(scales)
+library(stringr)
+library(caret)
+library(reshape2)
+library(mlr)
+library(tidyr)
+library(pROC)
+```
+
+
+
+
+
+```{r,message=FALSE,warning=FALSE}
+
+# reading in data types for survey data
+data_types_file <- read.csv(file = params[2],  
+                            na.strings = "",                    
+                            colClasses = "character")  
+
+# reading in data types for hospitalization data
+oshpd_data_types_file <- read.csv(file = params[4],  
+                                  na.strings = "",                    
+                                  colClasses = "character")  
+
+# creating a named character vector to use in assigning character and Date types for survey data
+data_types <- data_types_file[, 2]             
+names(data_types) <- data_types_file[, 1]  
+data_types <- data_types[data_types=="character" | data_types=="Date"]     
+
+# creating a named character vector to use in assigning Date types for hospitalization data
+oshpd_data_types <- oshpd_data_types_file[, 2]             
+names(oshpd_data_types) <- oshpd_data_types_file[, 1]  
+oshpd_data_types <- oshpd_data_types[oshpd_data_types=="Date"] 
+
+# reading in survey data and assigning data types
+analytic_data <- read.csv(file = params[3],
+                          na.strings = "",
+                          colClasses = data_types)
+
+# reading in hospitalization data file 
+oshpd_data <- read.csv(file = params[5], 
+                       na.strings = "")
+
+# converting date fields
+oshpd_data[names(oshpd_data_types)] <- lapply(oshpd_data[names(oshpd_data_types)], as.Date, "%m/%d/%Y")
+
+# dropping columns that already exist in analytic_data
+oshpd_data[c("date_of_birth_dt", "date_of_death_dt", "cause_of_death_cde", "cause_of_death_dsc", 
+             "qnr_1_fill_dt", "qnr_2_fill_dt", "ses_quartile_ind", "first_moveout_ca_dt")] <- list(NULL)
+
+# joining survey data and hospitalization data on participant_key
+combined_data <- inner_join(analytic_data, oshpd_data,by = "participant_key") # n = 132538
+
+```
+
+
+## Data cleaning.
+
+### variable selection and exclusion by hand checking 
+
+There are so many variables in the dataset. We exclude some useless or bad variables by hand checking and then group the remaining variables for simplicity and intuition. The following variables are excluded:
+
+- cause_of_death_dsc: This variables indicate so much information about our target variable, which may cause data leakage to machine learning models, thus excluded.
+- qnr_1/2/3/4/5/6_(mini)_fill_dt: questionaire filling dates are not useful
+- diag_icd_dsc, diag_ccs, proc_icd_dsc, proc_ccs: text description variables are excluded since we donot to intend text mining in this project
+- study_start_date_q3, analysis_end_date: not related with the objective
+
+
+The remaining variables are selected for downstream analysis.
+
+```{r}
+# participant_key used as the rowname
+# g1: basic characteristics of the patient: age, diet, weight, smoke, alchol, etc
+g1 = c("age_at_baseline","participant_race","menarche_age","fullterm_age1st",
+       "preg_ever_q1","preg_total_q1","meno_stattype","height_q1","weight_q1","bmi_q1",
+       "allex_hrs_q1","allex_life_hrs","stand_hrs","sit_hrs","sleep_hrs","vit_reg_no",
+       "diet_plant","diet_highprotfat","diet_highcarb","dief_ethnic","diet_saladwine",
+       "vit_mulvit_q1","serv_fats_q1","alchl_g_dayrecen","alchl_analyscat","smoke_lifeexpo",
+       "smoke_statcat","smoke_expocat","passmok_expocat","smoke_totyrs","smoke_totpackyrs",
+       "smoke_yrs_quit","cig_day_avg","shsmok_any")
+
+# g2: some date variables to be transformed and then excluded 
+g2 = c("date_of_birth_dt","date_of_death_dt","hysterectomy_dt","bilateral_mastectomy_dt",
+       "bilateral_oophorectomy_dt","first_moveout_ca_dt")
+
+# g3: related to community and population
+g3 = c("ses_quartile_ind","blockgroup90_urban_cat","adopted",
+       "twin","nih_ethnic_cat","birthplace","birthplace_mom","birthplace_dad",
+       "age_mom_atbirth","age_dad_atbirth","near_oilrefine")
+
+# g4: some important clinical characteristics such as surgery and drug history
+g4 = c("cause_of_death_cde","hysterectomy_ind","bilateral_mastectomy_ind","bilateral_oophorectomy_ind",
+       "oralcntr_ever_q1","oralcntr_yrs","brca","mammo_ever_q1","hbpmed_totyrs",
+       "nsaid_totyrs","endoca_self_q1","cervca_self_q1","ovryca_self_q1","lungca_self_q1",
+       "leuk_self_q1","hodg_self_q1","colnca_self_q1","thyrca_self_q1","meln_self_q1",
+       "diab_self_q1","stroke_self_q1","hrtatk_self_q1","hbp_self_q1","brca_selfsurvey",
+       "asthma_q3","insulin_daily","aceinhb_daily","othhbp_daily","tamox_daily","steroid_daily",
+       "brondil_daily","cholmed_daily","antidep_daily")
+```
+
+
+
+
+```{r}
+# a participant_key can correspond to multiple hospital visit_ids
+
+# h1: admission and discharge date to be transformed
+h1 = c("admission_dt","discharge_dt")
+
+# h2: hospital-related information
+h2 = c("length_of_stay_day_cnt","dnr_flg","facility_flg","src_admission_cde",
+       "src_site_cde","src_licensure_cde","src_route_cde","major_diag_cat_cde",
+       "patient_care_typ","facility_county_cde","facility_zip5_cde","spoken_lang_cde")
+
+# h3: financial and payer information
+h3 = c("payer_cat_cde","payer_plan_cde","payer_coverage_typ","total_charges_amt")
+
+# h4~h8: diagnoses and procedures by icd codes, ccs categories, and presence of admission
+h4 = c("diag_icd1","diag_icd2","diag_icd3","diag_icd4","diag_icd5")
+h5 = c("diag_ccs_code1","diag_ccs_code2","diag_ccs_code3","diag_ccs_code4","diag_ccs_code5")
+h6 = c("diag_poa1","diag_poa2","diag_poa3","diag_poa4","diag_poa5")
+h7 = c("proc_icd1","proc_icd2","proc_icd3","proc_icd4","proc_icd5")
+h8 = c("proc_ccs_code1","proc_ccs_code2","proc_ccs_code3","proc_ccs_code4","proc_ccs_code5")
+
+# deceased is our target variable, 0=No, 1=Yes
+```
+
+### excluding invalid records
+
+Some visit records are found to have date of death date earlier than admission date, these are invalid, thus excluded from the data. Some patients died during hospitalization, We also exclude  this portion of visit records since our main focus is on risk of death after discharge date. 
+
+```{r}
+features = c("participant_key","visit_id",g1,g2,g3,g4,h1,h2,h3,h4,h5,h6,h7,h8,"deceased")
+df = combined_data[,features]
+df = df[is.na(df$date_of_death_dt)|(df$admission_dt<=df$date_of_death_dt & df$date_of_death_dt>=df$discharge_dt),]
+```
+
+
+
+
+
+### one participant_key, multiple hospital visits
+
+One patient may have multiple hospital visits. As shown in the follwoing graph, Many patients went to more than 1 hospitals, and about 95% of participants went to less than 8 hospitals. Although most of the basic characteristics remain unchanged for a patient, the hospitalization data from different hospitalization visits may differ. In this case, we only use the hospitalization data of the last visit for a patient for accuracy because we think it is the latest for most related to the patients' death risk.
+
+
+```{r}
+tmp = df[,c("participant_key","visit_id")]
+hos_counts = table(tmp$participant_key)
+names(hos_counts) = NULL
+hos_counts = as.data.frame(hos_counts)
+ggplot(hos_counts, aes(x=Freq))+geom_bar(aes(y=cumsum(..count..)/sum(..count..)))+scale_y_continuous(labels=percent)+xlab("different hospitals")+ylab("cumulative sum of % of the data")+geom_hline(yintercept=0.95,color="red")+geom_vline(xintercept=8,color="red")
+```
+## Exploratory Data analysis
+
+### days to death after discharge date
+
+A summary graph of days to death after discharging is as follows. This helps us to determine the fixed time window of death to predict.We can see that the days to death after discharge is long-tail distributed. Note that Some patients died before discharge, those data are excluded and not shown in the plot. A sharp drop of death count happened when days after discharge is more than 60 days. Therefore, we choose to predict the risk of death witin 60 days of discharging.
+
+```{r}
+tmp = df[,c("participant_key","visit_id","admission_dt","discharge_dt","date_of_death_dt")]
+#tmp$days2death_af_admi = as.numeric(tmp$date_of_death_dt - tmp$admission_dt)
+#tmp$days2death_af_disc = as.numeric(tmp$date_of_death_dt - tmp$discharge_dt)
+#a= dim(tmp[tmp$days_to_death<30,])[1]
+#b= dim(tmp[tmp$days_to_death<=30 & tmp$days_to_death>=0 ,])[1]
+#c= dim(tmp[tmp$days_to_death<30 & tmp$days_to_death>0 ,])[1]
+#d= dim(tmp[tmp$days_to_death<30 & tmp$days_to_death>=0 ,])[1]
+#e= dim(tmp[tmp$days2death_af_admi==0,])[1]
+#c(a,b,c,d,e)
+tmp = as.data.table(tmp)
+tmp = tmp[,.SD[which.max(discharge_dt)],by=participant_key]
+tmp$days_to_death = as.numeric(tmp$date_of_death_dt - tmp$discharge_dt)/30
+alive_num = dim(tmp[is.na(tmp$days_to_death),])[1]
+tmp = tmp[!is.na(tmp$days_to_death),]
+dead_num = dim(tmp)[1]
+ggplot(tmp, aes(x=days_to_death))+geom_histogram(binwidth=1)+xlab("months(30 days) to death: after discharge")+scale_y_continuous(sec.axis=sec_axis(trans = ~./dead_num,labels = percent, name = "proportion"))
+#ggplot(tmp[tmp$months_to_death<0,], aes(x=months_to_death))+geom_histogram(binwidth=1)+ xlab("months to death: before discharge")+
+#ggplot(tmp[tmp$months_to_death>=0,], aes(x=months_to_death))+geom_histogram(binwidth=1,aes(y=cumsum(..count..)/sum(..count..)))+xlab("months to death: after discharge")+scale_y_continuous(labels=percent)
+
+```
+
+
+
+### alive/dead ratio
+
+The frequency counts is as follows. And the ratio of alive patients within 60 days after discharge to dead patients is `r counts[1]/counts[2]`. In other words, alive patients occupy a proportion of `r `counts[1]/(counts[2]+counts[1])` and dead patients occupy a proportion of `r counts[2]/(counts[2]+counts[1])`. The data is relatively balanced and will not incur some evaluation metric  issues for machine learning like other highly unbalanced data, in which one class occupy a very large portion of the whole data.
+
+```{r}
+counts = c(alive_num,dead_num)
+counts_name = c("alive_num","dead_num")
+for(i in 1:10){
+        counts = c(counts, dim(tmp[tmp$days_to_death<=i & tmp$days_to_death>=i-1 ,])[1])
+        counts_name = c(counts_name,paste("within_",i*30,"_days",collapse = ""))
+}
+names(counts) = counts_name
+as.data.frame(counts)
+```
+
+### seasonal or month-related deaths
+
+We summarized the death counts with respect to each month and to each quater to see if there are any seasonal or month-related deaths. It seems that Q1 has a slightly higher death counts ,and Q3 has a slightly lower death counts.  However, Rigorous statistical testing is needed to confirm the relationships.
+
+```{r}
+tmp$death_month = str_sub(tmp$date_of_death_dt,6,7)
+a = as.Date(cut(as.Date(tmp$date_of_death_dt, "%Y-%m-%d"),"month"))+32
+tmp$death_season = factor(quarters(a),levels=c("Q1","Q2","Q3","Q4"),labels=c("Q1","Q2","Q3","Q4"))
+ggplot(tmp, aes(x=death_month))+geom_bar()
+```
+
+```{r}
+ggplot(tmp, aes(x=death_season))+geom_bar()
+```
+
+We can use chi-square test to statistically check if the death are month or season related.
+
+```{r}
+p_month = chisq.test(as.matrix(table(tmp$death_month)))$p.value
+p_season = chisq.test(as.matrix(table(tmp$death_season)))$p.value
+```
+
+the p-value for month-related checking is `r p_month` and is `r p_season` for season related checking. Using a threshold of 0.05 we can say that there are indeed month or season realted deaths. 
+
+
+```{r}
+#tmp = df[,c("participant_key","visit_id",h4,"deceased")]
+#tmp = tmp[tmp$deceased=="1",]
+#tmp = melt.data.table(as.data.table(tmp), id.vars= c("participant_key","visit_id","deceased"),  measure.vars=h4)
+#ggplot(tmp, aes(x=))
+```
+
+
+
+```{r}
+tmp = df
+tmp = as.data.table(tmp)
+tmp = tmp[,.SD[which.max(discharge_dt)],by=participant_key]
+tmp$days_to_death = as.numeric(tmp$date_of_death_dt - tmp$admission_dt)/30
+tmp$dead60 = 0
+tmp[tmp$days_to_death<60,"dead60"] = 1
+```
+
+
+## Feature transformations
+
+We are about to build a XGboost classifier to predict the risk of death within 60 days after discharge. XGboost only accepts numerical data. Therefore, for categorical features, we first convert them to one-hot dummy features to feed into the model.
+
+### NA values.
+
+As shown in the following graph, many variables have high proportion of NA values. In this project, we treat NA as a special class of the corresponding variable and incorporate them into the model building. 
+
+
+```{r,warning=FALSE,message=FALSE}
+cols = summarizeColumns(tmp)
+cols$NApercent =  round(cols$na*100/dim(tmp)[1],2)
+cols = cols[order(cols$NApercent),]
+cols$name = factor(cols$name, levels = cols$name)
+p = ggplot(cols,aes(x=name,y=NApercent))+geom_bar(stat ="identity")+theme(axis.text.x=element_text(angle=45, vjust = 1, hjust=1,size=8))
+#ggsave(p,filename = "cols.pdf", dpi=720,width=14)
+p
+```
+
+### convert categorical variables to one-hot
+
+
+
+```{r,message=FALSE,warning=F}
+to_onehot_vars = c()
+to_null_vars = c()
+#========================transforming g group features====================================
+
+# g1: basci characteristics of the patient: age, diet, weight, smoke, alchol, etc
+# g1 = c("age_at_baseline","participant_race","menarche_age","fullterm_age1st",
+#        "preg_ever_q1","preg_total_q1","meno_stattype","height_q1","weight_q1","bmi_q1",
+#        "allex_hrs_q1","allex_life_hrs","stand_hrs","sit_hrs","sleep_hrs","vit_reg_no",
+#        "diet_plant","diet_highprotfat","diet_highcarb","dief_ethnic","diet_saladwine",
+#        "vit_mulvit_q1","serv_fats_q1","alchl_g_dayrecen","alchl_analyscat","smoke_lifeexpo",
+#        "smoke_statcat","smoke_expocat","passmok_expocat","smoke_totyrs","smoke_totpackyrs",
+#        "smoke_yrs_quit","cig_day_avg","shsmok_any")
+# age_at_baseline, menarche_age, fullterm_age1st,preg_total_q1,diet_plant,diet_highprotfat
+# diet_highcarb,dief_ethnic,diet_saladwine,alchl_g_dayrecen,smoke_lifeexpo,smoke_totyrs,
+# smoke_totpackyrs,smoke_yrs_quit,cig_day_avg,
+
+to_onehot_vars = c(to_onehot_vars, "meno_stattype","stand_hrs","sit_hrs","sleep_hrs",
+                   "vit_reg_no","vit_mulvit_q1","serv_fats_q1","alchl_analyscat","smoke_statcat",
+                   "smoke_expocat","passmok_expocat","passmok_expocat","shsmok_any")
+
+# g2: some date variables to be transformed and then excluded 
+# g2 = c("date_of_birth_dt","date_of_death_dt","hysterectomy_dt","bilateral_mastectomy_dt",
+#        "bilateral_oophorectomy_dt","first_moveout_ca_dt")
+tmp[, hysterectomy_age:= as.numeric(hysterectomy_dt - date_of_birth_dt)]
+tmp[,bilateral_mastectomy_age:= as.numeric(bilateral_mastectomy_dt - date_of_birth_dt)]
+tmp[,bilateral_oophorectomy_age := as.numeric(bilateral_oophorectomy_dt - date_of_birth_dt)] 
+to_null_vars = c(to_null_vars, g2)
+
+
+# g3: related to community and population
+# g3 = c("ses_quartile_ind","blockgroup90_urban_cat","adopted",
+#        "twin","nih_ethnic_cat","birthplace","birthplace_mom","birthplace_dad",
+#        "age_mom_atbirth","age_dad_atbirth","near_oilrefine")
+tmp[,nih_ethnic_cat := sapply(nih_ethnic_cat, FUN=function(x){strsplit(x,split=":")[[1]][1]})]
+to_onehot_vars = c(to_onehot_vars,g3)
+
+# g4: some important clinical characteristics such as surgery and drug history
+# g4 = c("cause_of_death_cde","hysterectomy_ind","bilateral_mastectomy_ind","bilateral_oophorectomy_ind",
+#        "oralcntr_ever_q1","oralcntr_yrs","brca","mammo_ever_q1","hbpmed_totyrs",
+#        "nsaid_totyrs","endoca_self_q1","cervca_self_q1","ovryca_self_q1","lungca_self_q1",
+#        "leuk_self_q1","hodg_self_q1","colnca_self_q1","thyrca_self_q1","meln_self_q1",
+#        "diab_self_q1","stroke_self_q1","hrtatk_self_q1","hbp_self_q1","brca_selfsurvey",
+#        "asthma_q3","insulin_daily","aceinhb_daily","othhbp_daily","tamox_daily","steroid_daily",
+#        "brondil_daily","cholmed_daily","antidep_daily")
+to_null_vars = c(to_null_vars,"cause_of_death_cde")
+to_onehot_vars = c(to_onehot_vars, "hysterectomy_ind","bilateral_mastectomy_ind","bilateral_oophorectomy_ind",
+                   "oralcntr_ever_q1", "oralcntr_yrs","brca","mammo_ever_q1","hbpmed_totyrs","nsaid_totyrs",
+                   "endoca_self_q1","cervca_self_q1","ovryca_self_q1","lungca_self_q1",
+                   "leuk_self_q1","hodg_self_q1","colnca_self_q1","thyrca_self_q1","meln_self_q1",
+                   "diab_self_q1","stroke_self_q1","hrtatk_self_q1","hbp_self_q1","brca_selfsurvey",
+                   "asthma_q3","insulin_daily","aceinhb_daily","othhbp_daily","tamox_daily","steroid_daily",
+                   "brondil_daily","cholmed_daily","antidep_daily")
+
+#========================transforming h group features====================================
+
+# h1: admission and discharge date to be transformed
+# h1 = c("admission_dt","discharge_dt")
+to_null_vars = c(to_null_vars, h1)
+
+# h2: hospital-related information
+# h2 = c("length_of_stay_day_cnt","dnr_flg","facility_flg","src_admission_cde",
+#       "src_site_cde","src_licensure_cde","src_route_cde","major_diag_cat_cde",
+#       "patient_care_typ","facility_county_cde","facility_zip5_cde","spoken_lang_cde")
+# length_of_stay_day_cnt unchanged
+to_onehot_vars = c(to_onehot_vars, "dnr_flg","facility_flg","src_admission_cde",
+       "src_site_cde","src_licensure_cde","src_route_cde","major_diag_cat_cde",
+       "patient_care_typ","facility_county_cde","spoken_lang_cde")
+to_null_vars = c(to_null_vars,"facility_zip5_cde" )
+
+
+# h3: financial and payer information
+# h3 = c("payer_cat_cde","payer_plan_cde","payer_coverage_typ","total_charges_amt")
+# total_charges_amt unchanged
+to_onehot_vars = c(to_onehot_vars,"payer_cat_cde","payer_plan_cde","payer_coverage_typ")
+
+
+# h4~h8: diagnoses and procedures by icd codes, ccs categories, and presence of admission
+# h4 = c("diag_icd1","diag_icd2","diag_icd3","diag_icd4","diag_icd5")
+# h5 = c("diag_ccs_code1","diag_ccs_code2","diag_ccs_code3","diag_ccs_code4","diag_ccs_code5")
+# h6 = c("diag_poa1","diag_poa2","diag_poa3","diag_poa4","diag_poa5")
+# h7 = c("proc_icd1","proc_icd2","proc_icd3","proc_icd4","proc_icd5")
+# h8 = c("proc_ccs_code1","proc_ccs_code2","proc_ccs_code3","proc_ccs_code4","proc_ccs_code5")
+to_null_vars = c(to_null_vars, h4,h7 )
+to_null_vars = c(to_null_vars, c("participant_key", "visit_id", "deceased", "days_to_death"))
+to_onehot_vars = c(to_onehot_vars, h5,h6,h8)
+tmp = tmp[,!to_null_vars, with=FALSE]
+
+#=========== transforming to onehot variables =======================
+
+for(each in to_onehot_vars){
+        print(each)
+        eval( parse(text=paste0("tmp$",each,' = paste0("',each,"_\",tmp$",each,")")) )
+        eval( parse(text=paste0('tmp = dcast.data.table(data=tmp, ...~ ',each,',length, value.var = "',each,'")')) )
+}
+setnames(tmp, colnames(tmp), gsub("[-*]","",colnames(tmp)))
+tmp[,dead60:=factor(dead60)]
+colnames(tmp)[467] = "spoken_lang_cde__star"
+tmp = as.data.frame(tmp)
+save(tmp, file="tmp.Rdata")
+```
+```{r}
+a=dim(tmp)[1]
+b= dim(tmp)[2]
+```
+All categorical variables are converted to one-hot variables. After conversion, we have 44458 records, with each record having 2803 features.
+
+## Model Training
+
+### cross-validation
+
+20% of the data are hold out separately as the test set, and the remaining 80% of the data are used for model training. We choose auc(precision-recall curve) as the evaluation metric.
+
+
+```{r}
+set.seed(1234)
+split_desc = makeResampleDesc(method="Holdout",
+                              split=0.7,
+                              stratify=TRUE)
+classifier = makeClassifTask(id="deaths within 60 days after discharge",
+                             data = tmp,
+                             target = "dead60")
+split = makeResampleInstance(split_desc,task=classifier)
+train = split$train.inds[[1]]
+other = split$test.inds[[1]]
+val = sample(other,length(other)/2)
+test = setdiff(other, val)
+dtrain = xgb.DMatrix(as.matrix(tmp[train,colnames(tmp)!="dead60"]),
+                     label = as.numeric(tmp[train,]$dead60)-1)
+dval = xgb.DMatrix(as.matrix(tmp[val,colnames(tmp)!="dead60"]),
+                     label = as.numeric(tmp[val,]$dead60)-1)
+dtest = xgb.DMatrix(as.matrix(tmp[test,colnames(tmp)!="dead60"]),
+                     label = as.numeric(tmp[test,]$dead60)-1)
+
+cross_validation = xgb.cv(data=dtrain,
+                  nround=120,
+                  nfold=10,
+                  objective = "binary:logistic",
+                  eval_metric = "aucpr",
+                  early_stopping_rounds = 5,
+                  print_every_n = 5,
+                  prediction=TRUE,
+                  gamma=2)
+```
+
+
+
+```{r}
+ggplot(cross_validation$evaluation_log,aes(x=iter))+geom_line(aes(y=train_aucpr_mean,color="train_aucpr_mean"))+geom_line(aes(y=test_aucpr_mean,color="test_aucpr_mean"))+xlab("iterations")+ylab("aucpr")
+```
+
+We can see the model reached a test_aucpr_mean of about 0.9, which is a fairly good result.
+
+### train the model 
+
+We can train the final model using the whole train data and use the model to make predictions on future unseen data
+```{r}
+model = xgb.train(data=dtrain,
+                  nround=200,
+                  objective = "binary:logistic",
+                  eval_metric = "auc",
+                  print_every_n = 10,
+                  gamma=2)
+```
+
+### model performance on unseen data
+
+The trained model can be used to predict on the previoulys hold out test data to see its performance unseen data.  The confusion matrix is as follows. We can see the precision reaches 0.8378 and the recall reaches 0.8219, with a overall F1 score of 0.8297.
+
+```{r}
+test_preds = predict(model, dtest)
+test_preds = ifelse(test_preds>0.5,1,0)
+xg1_basic = confusionMatrix(as.factor(test_preds),tmp[test,]$dead60,positive="1",mode="prec_recall")
+roc_basic = roc(tmp[test,]$dead60,test_preds, algorithm=2)
+auc_basic = auc(roc_basic)
+xg1_basic
+```
+
+
+### parameter tuning
+
+Although the xgboost model witout parameter tuning already achieved rather good results, we can still do some parameter tuning to get better results. In this part, we use random parameter tuning to tune the model to get better results.
+
+```{r}
+set.seed(12345)
+# params = makeParamSet(makeIntegerParam("max_depth",lower = 3L, upper=10L),
+#                       makeNumericParam("min_child_weight"), lower=1L, upper=10L,
+#                       makeNumericParam("subsample",lower=0.5,upper=1),
+#                       makeNumericParam("colsample_bytree",lower=0.5,upper=1),
+#                       makeIntegerParam("gamma"),lower=1L, upper=6L)
+#best_model = NULL
+#best_param = NULL
+#best_val_aucpr = -1
+for(i in 1:20){
+  set.seed(i)
+  param = list(max_depth = sample(3:10,1),
+               eta = runif(1, 0.01, 0.3),
+               subample = runif(1, 0.7, 1),
+               colsample_bytree = runif(1, 0.5, 1),
+               min_child_weight = sample(1:10,1),
+               gamma = sample(1:6, 1))
+  tmp_model = xgb.train(data=dtrain,
+                  nround=400,
+                  objective = "binary:logistic",
+                  eval_metric = "aucpr",
+                  print_every_n = 20,
+                  early_stopping_rounds = 40,
+                  params = param,
+                  watchlist = list(train=dtrain,val=dval))
+  if(as.numeric(strsplit(tmp_model$best_msg,":")[[1]][3])>best_val_aucpr){
+    best_val_aucpr = as.numeric(strsplit(tmp_model$best_msg,":")[[1]][3])
+    best_model = tmp_model
+    best_param = param
+  }
+
+}
+```
+### re-train the model using the best parameters
+
+```{r}
+save(best_param, best_model, file="best_model_best_param.Rdata")
+# final_model = xgb.train(data=dtrain,
+#                   nround=256,
+#                   objective = "binary:logistic",
+#                   eval_metric = "aucpr",
+#                   print_every_n = 10,
+#                   params = best_param)
+
+```
+### model performance after re-training
+
+```{r}
+test_preds = predict(final_model, dtest)
+test_preds = ifelse(test_preds>0.5,1,0)
+xg1_tuned = confusionMatrix(as.factor(test_preds),tmp[test,]$dead60,positive="1",mode="prec_recall")
+roc1 = roc(tmp[test,]$dead60,test_preds, algorithm=2)
+auc1 = auc(roc1)
+xg1_tuned
+```
+
+we can see the following improvements after parameter tuning:
+
+
+
+
+### variable importance
+
+We can plot the feature importance as follows. We can see the top three important features are age_at_baseline, dnr_flg_N, and length_of_stay_day_cnt. 
+
+
+```{r}
+important_matrix = xgboost::xgb.importance(colnames(tmp),model=final_model)
+p = xgboost::xgb.plot.importance(important_matrix,top_n=15)
+```
+
+### checking the importance of co-morbiities.
+
+
+We can see from the variable importance plot that co-morbidities do play a role in predicting the risk of death. The top important one diag_ccs_code3_41 represents "Cancer; other and unspecified primary", which fairly matches our expectation.
+
+## Weight of evidence for XGBoost model
+
+In the previous model, all the categorical variables are converted to one-hot variables. This will erase the relationships among the different categories. In this part, we try to use the weight of evidence method to re-code the categorical variables. The weight of evidence tells the predictive power of an indenpedent variable in relation to the dependent variable. For a specific category $A$ of a variable $Var$, its $WOE$ is calculated as follows: 
+
+$$
+WOE = ln(\frac{
+\%non-events}{
+\% events}) =ln(\frac{nondeath\ within\ 60\ days\ }{deaths\ within\ 60\ days })
+$$
+
+And then, for variable $Var$, its category $A$ is replaced by its $WOE$.
+
+```{r, message=FALSE, warning=FALSE}
+new = df
+new = as.data.table(new)
+new = new[,.SD[which.max(discharge_dt)],by=participant_key]
+new$days_to_death = as.numeric(new$date_of_death_dt - new$admission_dt)/30
+new$dead60 = 0
+new[new$days_to_death<60,"dead60"] = 1
+new = new[,!to_null_vars, with=FALSE]
+ref = new[train,]
+for(each in to_onehot_vars){
+        print(each)
+        eval( parse(text=paste0("new$",each,"=replace_na(new$",each,',"NA_GROUP")')))
+        eval( parse(text=paste0("a=table(ref$",each,",ref$dead60)")) )
+        b=log((a[,"0"]+1)/(a[,"1"]+1))
+        eval( parse(text=paste0("new$",each,"=b[match(new$",each,",names(b))]")) )
+
+}
+setnames(new, colnames(new), gsub("[-*]","",colnames(new)))
+new[,dead60:=factor(dead60)]
+new = as.data.frame(new)
+```
+
+
+```{r}
+# set.seed(1234)
+# new_split_desc = makeResampleDesc(method="Holdout",
+#                               split=0.7,
+#                               stratify=TRUE)
+# new_classifier = makeClassifTask(id="deaths within 60 days after discharge",
+#                              data = new,
+#                              target = "dead60")
+# 
+# 
+# new_split = makeResampleInstance(new_split_desc,task=new_classifier)
+# new_train = new_split$train.inds[[1]]
+# new_other = new_split$test.inds[[1]]
+# new_val = sample(new_other,length(new_other)/2)
+# test = setdiff(other, val)
+
+new_dtrain = xgb.DMatrix(as.matrix(new[train,colnames(new)!="dead60"]),
+                     label = as.numeric(new[train,]$dead60)-1)
+new_dval = xgb.DMatrix(as.matrix(new[val,colnames(new)!="dead60"]),
+                     label = as.numeric(new[val,]$dead60)-1)
+new_dtest = xgb.DMatrix(as.matrix(new[test,colnames(new)!="dead60"]),
+                     label = as.numeric(new[test,]$dead60)-1)
+# new_cross_validation = xgb.cv(data=new_dtrain,
+#                   nround=120,
+#                   nfold=10,
+#                   objective = "binary:logistic",
+#                   eval_metric = "aucpr",
+#                   early_stopping_rounds = 5,
+#                   print_every_n = 5,
+#                   prediction=TRUE)
+```
+
+```{r}
+#ggplot(model$evaluation_log,aes(x=iter))+geom_line(aes(y=train_aucpr_mean,color="train_aucpr_mean"))+geom_line(aes(y=test_aucpr_mean,color="test_aucpr_mean"))+xlab("iterations")+ylab("aucpr")
+set.seed(12345)
+# params = makeParamSet(makeIntegerParam("max_depth",lower = 3L, upper=10L),
+#                       makeNumericParam("min_child_weight"), lower=1L, upper=10L,
+#                       makeNumericParam("subsample",lower=0.5,upper=1),
+#                       makeNumericParam("colsample_bytree",lower=0.5,upper=1),
+#                       makeIntegerParam("gamma"),lower=1L, upper=6L)
+#new_best_model = NULL
+#new_best_param = NULL
+#new_best_val_aucpr = -1
+for(i in 1:20){
+  set.seed(i)
+  param = list(max_depth = sample(3:10,1),
+               eta = runif(1, 0.01, 0.3),
+               subample = runif(1, 0.7, 1),
+               colsample_bytree = runif(1, 0.5, 1),
+               min_child_weight = sample(1:10,1),
+               gamma = sample(1:6, 1))
+  tmp_model = xgb.train(data=new_dtrain,
+                  nround=400,
+                  objective = "binary:logistic",
+                  eval_metric = "aucpr",
+                  print_every_n = 20,
+                  early_stopping_rounds = 40,
+                  params = param,
+                  watchlist = list(train=new_dtrain,val=new_dval))
+  if(as.numeric(strsplit(tmp_model$best_msg,":")[[1]][3])>new_best_val_aucpr){
+    new_best_val_aucpr = as.numeric(strsplit(tmp_model$best_msg,":")[[1]][3])
+    new_best_model = tmp_model
+    new_best_param = param
+  }
+
+}
+```
+
+
+```{r}
+new_test_preds = predict(new_best_model, new_dtest)
+new_test_preds = ifelse(new_test_preds>0.5,1,0)
+xg_new = confusionMatrix(as.factor(new_test_preds),new[test,]$dead60,positive="1",mode="prec_recall")
+#roc_new = roc(new[test,]$dead60,new_test_preds, algorithm=2)
+#auc_new = auc(roc_new)
+xg_new
+```
+
+
+
+## Conlusion and Discussion
+
+In this project, we employ machine learning methods XGBoost to build a classifier to predict the risk of death within 60 days of discharging. We also use random search method to tune the parameters to get a better model. 
+
+1. The model(one-hot category) finally achieves a performance of F1 score 0.8310 after parameter tuning, which is a relatively good result. The model(weight of evidence) finally achieves a performance of F1 score after a little bit of parameter tuning
+
+
+2. Based on the variable importance, variable length_of_stay_day_cnt which represents the time window after hospitalization, ranks the third of the variable importance, indicating its role in predicting the risk of death.
+
+3. Based on the variable importance, certain types of co-morbidities do play a role in predicting the risk of death. The most important of them is diag_ccs_code3_41 which represents cancer. 
+
+4. Chi-square tests are also used to help us confirm that the deaths are indeed month or season related, where Q3 season has the lowest death rate.
+
+5. Our model transforms all categorical variables to one-hot variables, this is a effective approach for classification problems. However, the information within the relationships among the categroies in a feature are lost. Therefore, we tried the weight of evidence approach to try to solve this problem. The result shows it works by improving the aucpr.
+
+6. The model performance is summarized as follows for comparision
+
+```{r}
+#n = c("accuracy","Recall","Precision","F1")
+a = c(xg1_basic[3]$overall[1],xg1_basic[4]$byClass[5],
+      xg1_basic[4]$byClass[6],xg1_basic[4]$byClass[7])
+b = c(xg1_tuned[3]$overall[1],xg1_tuned[4]$byClass[5],
+      xg1_tuned[4]$byClass[6],xg1_tuned[4]$byClass[7])
+c = c(xg_new[3]$overall[1],xg_new[4]$byClass[5],
+      xg_new[4]$byClass[6],xg_new[4]$byClass[7])
+
+res = data.frame(
+           xgboost_default_paras=a, 
+           xgboost_parameter_tuning=b,
+           xgboost_using_WOE=c)
+res
+```
+
+We use random search to tune the parameter for xgboost using one-hot method only for 20 times, therefore "xgboost_parameter_tuning" may have worse results than "xgboost_default_paras". However, "xgboost_using_WOE" is better than "xgboost_default_paras" or "xgboost_parameter_tuning", showing that weight of evidence is more suitable to our case. Maybe we need more parameter tuning rounds
+
+
